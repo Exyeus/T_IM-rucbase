@@ -41,7 +41,9 @@ struct PageId {
 
 // PageId的自定义哈希算法, 用于构建unordered_map<PageId, frame_id_t, PageIdHash>
 struct PageIdHash {
-    size_t operator()(const PageId& x) const noexcept { return std::hash<uint64_t>{}(x.hash_key()); }
+    size_t operator()(const PageId& x) const noexcept { 
+        return std::hash<uint64_t>{}(x.hash_key()); 
+    }
 };
 
 template <>

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MulanPSL-2.0
 
 #include "buffer_pool_manager.h"
+#include "disk_manager.h"
 
 /**
- * @description: 从free_list或replacer中得到可淘汰帧页的 *frame_id
+ * @description: 从free_list或replacer中得到可淘汰帧页的 *frame_id. 
+ *               true for getting evicted, getting free ones instead.
  * @return {bool} true: 可替换帧查找成功 , false: 可替换帧查找失败
  * @param {frame_id_t*} frame_id 帧页id指针,返回成功找到的可替换帧id
  */
@@ -13,6 +15,20 @@ bool BufferPoolManager::find_victim_page(frame_id_t* frame_id) {
     // 1 使用BufferPoolManager::free_list_判断缓冲池是否已满需要淘汰页面
     // 1.1 未满获得frame
     // 1.2 已满使用lru_replacer中的方法选择淘汰页面
+    // 说明: free_list_ 是 尚未映射磁盘页的空闲帧
+    if (!free_list_.empty()) {
+        // Still, no need to evict.
+        // Just give the front to frame_id
+        *frame_id = free_list_.front();
+        //free_list_.erase(free_list_.begin());
+        free_list_.pop_front();
+        return true;
+        // Is this compliant to the rules?
+    } 
+
+    if (replacer_->victim(frame_id)) {
+        return true;
+    }
 
     return false;
 }
@@ -29,6 +45,21 @@ void BufferPoolManager::update_page(Page* page, PageId new_page_id, frame_id_t n
     // 1 如果是脏页，写回磁盘，并且把dirty置为false
     // 2 更新page table
     // 3 重置page的data，更新page id
+    // std::scoped_lock lock{latch_}; 神秘，加了这个好像会直接卡死？
+    if (page->is_dirty_) {
+        // 注意, PageId 包含 fd 和 page_no, offset 就是数据, 不要被名字困惑.
+        disk_manager_->write_page(page->id_.fd, page->id_.page_no,
+                                  page->data_, PAGE_SIZE);
+        page->is_dirty_ = false;
+    }
+
+    page_table_.erase(page->id_);
+    page_table_[new_page_id] = new_frame_id;
+
+    page->reset_memory();
+    page->id_ = new_page_id;
+    
+    
 }
 
 /**
@@ -48,7 +79,40 @@ Page* BufferPoolManager::fetch_page(PageId page_id) {
     //  3.     调用disk_manager_的read_page读取目标页到frame
     //  4.     固定目标页，更新pin_count_
     //  5.     返回目标页
-    return nullptr;
+    std::scoped_lock lock{latch_};
+    auto it = page_table_.find(page_id);
+    if (it != page_table_.end()) {
+        // This exists in page_table.
+        frame_id_t frame_id = it->second;
+        Page* page = &pages_[frame_id];
+        // pin_count_ 在哪里增加?
+        page->pin_count_++;
+        replacer_->pin(frame_id);
+
+        return page;
+    } 
+    // Cache Miss, considering fetch the page.
+    // Cases: 1. free_list from frames; 2. need to evict; 3. unable to evict -> nullptr
+    
+    frame_id_t frame_id;
+    bool has_get_frame = find_victim_page(&frame_id);
+
+    if (!has_get_frame) {
+        return nullptr;    
+    }
+
+    // pages_ 是一个 std::unique_ptr<Page[]> , 但是里面 Page 还是一个个指针
+    Page* page = &pages_[frame_id];
+    update_page(page, page_id, frame_id);
+
+    // fd 和 page_no 看起来经常是一起出现的? 那这里两个参数分开来调用有什么意义呢?
+    disk_manager_->read_page(page->id_.fd, page->id_.page_no, page->data_, PAGE_SIZE);
+
+    page->pin_count_++;
+    replacer_->pin(frame_id);
+
+    return page;
+
 }
 
 /**
@@ -67,7 +131,36 @@ bool BufferPoolManager::unpin_page(PageId page_id, bool is_dirty) {
     // 2.2 若pin_count_大于0，则pin_count_自减一
     // 2.2.1 若自减后等于0，则调用replacer_的Unpin
     // 3 根据参数is_dirty，更改P的is_dirty_
+    std::scoped_lock lock{latch_};
+    // auto page = page_table_.find(page_id);
+    auto it = page_table_.find(page_id);
+
+    if (it == page_table_.end()) {
+        return false;
+    }
+
+    frame_id_t frame_id = it->second;
+
+    Page* page = &pages_[frame_id];
+
+    if (page->pin_count_ <= 0) {
+        return false;
+    }
+
+    if (!page->is_dirty_) {
+        page->is_dirty_ = is_dirty;
+    }
+
+    page->pin_count_--;
+
+    if (page->pin_count_ == 0) {
+        replacer_->unpin(frame_id);
+    }
+    
     return true;
+    /*
+     bpm.fetch(pageid) 是行不通的, 那个属于是调用 page, 增加 page 引用计数.
+     */
 }
 
 /**
@@ -82,7 +175,14 @@ bool BufferPoolManager::flush_page(PageId page_id) {
     // 1.1 目标页P没有被page_table_记录 ，返回false
     // 2. 无论P是否为脏都将其写回磁盘。
     // 3. 更新P的is_dirty_
-
+    std::scoped_lock lock{latch_};
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end()) {
+        return false;
+    }
+    disk_manager_->write_page(page_id.fd, page_id.page_no, 
+                              pages_[it->second].data_, PAGE_SIZE);
+    pages_[it->second].is_dirty_ = false;
     return true;
 }
 
@@ -97,7 +197,21 @@ Page* BufferPoolManager::new_page(PageId* page_id) {
     // 3.   将frame的数据写回磁盘
     // 4.   固定frame，更新pin_count_
     // 5.   返回获得的page
-    return nullptr;
+    std::scoped_lock lock{latch_};
+    frame_id_t frame_id;
+    bool has_available_frame = find_victim_page(&frame_id);
+    if (!has_available_frame) {
+        return nullptr;
+    }
+    page_id_t new_page_id = disk_manager_->allocate_page(page_id->fd);
+    page_id->page_no = new_page_id;
+
+    update_page(&pages_[frame_id], *page_id
+                /*{page_id->fd, new_page_id}*/, frame_id);
+    
+    replacer_->pin(frame_id);
+    pages_[frame_id].pin_count_ = 1;
+    return &pages_[frame_id];
 }
 
 /**
@@ -110,11 +224,50 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 2.   若目标页的pin_count不为0，则返回false
     // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
 
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end()) {
+        return true;
+    }
+    Page* page = &pages_[it->second];
+    if (page->pin_count_ > 0) {
+        return false;
+    }
+    frame_id_t current_frame_id = page_table_[page_id];
+    // if (page->is_dirty_) {
+        // 脏了就落盘
+    // ?? 确定一定要写?
+    disk_manager_->write_page(page_id.fd, page_id.page_no, page->data_, PAGE_SIZE);
+    // }
+    // 从 frame 里面把这个 frame 移除.
+    // 反直觉: pin 是确认这个不必被 replacer_ 考虑, 因为它正在被用.
+    replacer_->pin(current_frame_id);
+    page_table_.erase(page_id);
+
+    // 重置 page 的数据
+    // 这里是会起名字的 😅 
+    // pages 原来是 frames 的驻地啊
+    page->is_dirty_ = false;
+    page->pin_count_ = 0;
+    page->id_ = {};
+    page->reset_memory(); // 看起来没什么好管的，是否有效足以告诉你一切
+    
+    
+    free_list_.push_front(current_frame_id);
     return true;
+
 }
 
 /**
  * @description: 将buffer_pool中的所有页写回到磁盘
  * @param {int} fd 文件句柄
  */
-void BufferPoolManager::flush_all_pages(int fd) {}
+void BufferPoolManager::flush_all_pages(int fd) {
+    std::scoped_lock lock{latch_};
+    for (auto page = page_table_.begin(); page != page_table_.end(); page++) {
+        if (page->first.fd != fd) {
+            continue;
+        }
+        disk_manager_->write_page(page->first.fd, page->first.page_no, pages_[page->second].data_, PAGE_SIZE);
+        pages_[page->second].is_dirty_ = false;
+    }
+}
