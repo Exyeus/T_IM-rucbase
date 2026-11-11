@@ -223,7 +223,7 @@ bool BufferPoolManager::delete_page(PageId page_id) {
     // 1.   在page_table_中查找目标页，若不存在返回true
     // 2.   若目标页的pin_count不为0，则返回false
     // 3.   将目标页数据写回磁盘，从页表中删除目标页，重置其元数据，将其加入free_list_，返回true
-
+    std::scoped_lock lock{latch_};
     auto it = page_table_.find(page_id);
     if (it == page_table_.end()) {
         return true;

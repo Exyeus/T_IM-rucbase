@@ -79,7 +79,11 @@ RmPageHandle RmFileHandle::fetch_page_handle(int page_no) const {
     // Todo:
     // 使用缓冲池获取指定页面，并生成page_handle返回给上层
     // if page_no is invalid, throw PageNotExistError exception
-
+    // RmRecord 竟然持有一个 fd_
+    
+    Page *page = buffer_pool_manager_->fetch_page(
+        PageId{.fd = fd_, .page_no = page_no});
+    
     return {&file_hdr_, nullptr};
 }
 
