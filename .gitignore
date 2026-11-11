@@ -34,3 +34,5 @@ CMakeUserPresets.json
 deps/*
 !deps/nlohmann/
 .dockerignore
+
+*Test_db/
