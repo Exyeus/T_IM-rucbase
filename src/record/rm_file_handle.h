@@ -22,6 +22,7 @@ class RmManager;
  * @brief 框架内部的记录页视图。Lab1 作业实现 fetch_page_handle / unpin，不要实现本类型。
  *
  * 不拥有 Page，也不负责解除 pin。持有它的作用域必须保证页面保持固定。
+ * bitmap 没有初始化, 要当心呐
  */
 struct RmPageHandle {
     const RmFileHdr* file_hdr = nullptr;

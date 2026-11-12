@@ -189,7 +189,7 @@ bool BufferPoolManager::flush_page(PageId page_id) {
 /**
  * @description: 创建一个新的page，即从磁盘中移动一个新建的空page到缓冲池某个位置。
  * @return {Page*} 返回新创建的page，若创建失败则返回nullptr
- * @param {PageId*} page_id 当成功创建一个新的page时存储其page_id
+ * @param {PageId*} page_id 当成功创建一个新的page时存储其page_id. 意味着 caller 需要传入其中
  */
 Page* BufferPoolManager::new_page(PageId* page_id) {
     // 1.   获得一个可用的frame，若无法获得则返回nullptr
